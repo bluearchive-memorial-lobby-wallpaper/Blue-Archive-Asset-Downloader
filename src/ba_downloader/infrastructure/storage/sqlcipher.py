@@ -33,6 +33,7 @@ class SqlCipherRawExporter:
     SALT_SIZE = 16
     HMAC_KDF_ITERATIONS = 2
     HMAC_SALT_MASK = 0x3A
+    HMAC_SALT_MASKS = (0x3A, 0x58)
 
     def export(self, input_path: Path, output_path: Path, key_hex: str) -> None:
         key = self._decode_raw_key(key_hex)
@@ -59,25 +60,21 @@ class SqlCipherRawExporter:
                             f"Unexpected end of input at SQLCipher page {page_no}."
                         )
                     if page_no == 1:
-                        hmac_key = self._derive_hmac_key(
-                            key,
-                            page[: self.SALT_SIZE],
-                        )
+                        hmac_key = self._derive_hmac_key(key, page[: self.SALT_SIZE], self.HMAC_SALT_MASK)
 
                     cipher_offset = self.SALT_SIZE if page_no == 1 else 0
                     cipher_length = usable_size - cipher_offset
                     iv_offset = usable_size
                     hmac_offset = usable_size + self.IV_SIZE
 
-                    self._verify_page_hmac(
-                        page,
-                        cipher_offset,
-                        cipher_length,
-                        iv_offset,
-                        hmac_offset,
-                        page_no,
-                        hmac_key,
-                    )
+                    try:
+                        self._verify_page_hmac(page, cipher_offset, cipher_length, iv_offset, hmac_offset, page_no, hmac_key)
+                    except SqlCipherRawExportError:
+                        if page_no != 1:
+                            raise
+                        alternate = self._derive_hmac_key(key, page[: self.SALT_SIZE], self.HMAC_SALT_MASKS[1])
+                        self._verify_page_hmac(page, cipher_offset, cipher_length, iv_offset, hmac_offset, page_no, alternate)
+                        hmac_key = alternate
                     output_file.write(
                         self._decrypt_page(
                             key,
@@ -108,8 +105,8 @@ class SqlCipherRawExporter:
             ) from exc
 
     @classmethod
-    def _derive_hmac_key(cls, raw_key: bytes, file_salt: bytes) -> bytes:
-        hmac_salt = bytes(value ^ cls.HMAC_SALT_MASK for value in file_salt)
+    def _derive_hmac_key(cls, raw_key: bytes, file_salt: bytes, mask: int | None = None) -> bytes:
+        hmac_salt = bytes(value ^ (cls.HMAC_SALT_MASK if mask is None else mask) for value in file_salt)
         return hashlib.pbkdf2_hmac(
             "sha512",
             raw_key,
